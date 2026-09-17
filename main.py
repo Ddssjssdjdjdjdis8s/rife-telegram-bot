@@ -8,9 +8,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME")
 KAGGLE_API_TOKEN = os.getenv("KAGGLE_API_TOKEN")
 
+# Принудительно записываем креды в переменные окружения, которые ждет библиотека kaggle
 os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
 os.environ["KAGGLE_KEY"] = KAGGLE_API_TOKEN
 
+# Создаем объект API после установки переменных
 api = KaggleApi()
 api.authenticate()
 
@@ -49,4 +51,3 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
     app.run_polling()
-  
