@@ -778,9 +778,7 @@ def push_kaggle_job(
     # НИКАКОГО kernels_pull() ЗДЕСЬ НЕТ.
     # Мы сразу отправляем нашу новую версию Kernel.
 
-    api.kernels_push(
-        path=str(WORKER_DIR)
-    )
+    api.kernels_push(str(WORKER_DIR))
 
     logger.info(
         "Kaggle job успешно отправлен"
