@@ -1,2 +1,2 @@
 python-telegram-bot==20.7
-kaggle==1.6.6
+kaggle>=1.8.0
