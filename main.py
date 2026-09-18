@@ -376,7 +376,11 @@ async def fps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Подготавливаю задачу для Kaggle...")
     try:
         telegram_file = await context.bot.get_file(user_videos[user_id]["file_id"])
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{telegram_file.file_path}"
+        file_path = telegram_file.file_path
+        if file_path.startswith(("http://", "https://")):
+            file_url = file_path
+        else:
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         await asyncio.to_thread(
             push_kaggle_job, file_url, update.effective_chat.id, target_fps
         )
