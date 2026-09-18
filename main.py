@@ -94,9 +94,7 @@ os.environ[
     "KAGGLE_USERNAME"
 ] = KAGGLE_USERNAME
 
-
 api = KaggleApi()
-
 api.authenticate()
 
 
@@ -156,10 +154,35 @@ user_videos = {}
 
 
 # ============================================================
-# WORKER CODE
+# ФУНКЦИЯ СОЗДАНИЯ WORKER-КОДА
 # ============================================================
 
-WORKER_CODE = r'''
+def build_worker_code(
+    video_url,
+    chat_id,
+    target_fps
+):
+
+    # ВАЖНО:
+    # Параметры конкретной задачи вставляются
+    # прямо в Kaggle worker.
+    #
+    # Поэтому worker больше не зависит
+    # от job_config.json.
+
+    worker_config = {
+        "VIDEO_URL": video_url,
+        "CHAT_ID": str(chat_id),
+        "BOT_TOKEN": BOT_TOKEN,
+        "TARGET_FPS": int(target_fps)
+    }
+
+    config_json = json.dumps(
+        worker_config,
+        ensure_ascii=False
+    )
+
+    worker_code = r'''
 import os
 import json
 import shutil
@@ -169,25 +192,16 @@ from pathlib import Path
 
 
 # ============================================================
-# ПУТЬ К ПАПКЕ WORKER
+# CONFIG ДЛЯ ЭТОЙ ЗАДАЧИ
 # ============================================================
 
-SCRIPT_DIR = Path(
-    __file__
-).resolve().parent
+JOB_CONFIG = __JOB_CONFIG__
 
 
-# ВАЖНО:
-# Не используем просто "job_config.json",
-# потому что Kaggle запускает скрипт через
-# /kaggle/src/script.py.
-#
-# Конфиг должен находиться рядом с worker-файлом.
-
-CONFIG_FILE = (
-    SCRIPT_DIR /
-    "job_config.json"
-)
+VIDEO_URL = JOB_CONFIG["VIDEO_URL"]
+CHAT_ID = JOB_CONFIG["CHAT_ID"]
+BOT_TOKEN = JOB_CONFIG["BOT_TOKEN"]
+TARGET_FPS = int(JOB_CONFIG["TARGET_FPS"])
 
 
 # ============================================================
@@ -226,19 +240,17 @@ OUTPUT_FILE = "output.mp4"
 
 
 # ============================================================
-# COMMAND
+# ВЫПОЛНЕНИЕ КОМАНД
 # ============================================================
 
-def run(
-    command,
-    name
-):
+def run(command, name):
 
     print()
     print("=" * 60)
     print(name)
     print("=" * 60)
     print(command)
+    print("=" * 60)
     print()
 
     result = subprocess.run(
@@ -254,48 +266,83 @@ def run(
 
 
 # ============================================================
-# CONFIG
+# ПРОВЕРКА ФАЙЛОВ
 # ============================================================
 
-def load_config():
+def check_environment():
+
+    print("=" * 60)
+    print("ПРОВЕРКА ОКРУЖЕНИЯ KAGGLE")
+    print("=" * 60)
 
     print(
-        f"Ищем job_config.json: "
-        f"{CONFIG_FILE}"
+        "Текущая директория:",
+        Path.cwd()
     )
 
-    if not CONFIG_FILE.exists():
+    print(
+        "Python:",
+        os.sys.version
+    )
 
-        raise RuntimeError(
-            "job_config.json не найден.\n"
-            f"Ожидаемый путь: {CONFIG_FILE}\n"
-            f"Текущая директория: {Path.cwd()}\n"
-            f"Содержимое SCRIPT_DIR: "
-            f"{list(SCRIPT_DIR.iterdir())}"
+    print()
+
+    result = subprocess.run(
+        "which ffmpeg",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+
+    print(
+        "ffmpeg:",
+        result.stdout.strip()
+        if result.stdout.strip()
+        else "НЕ НАЙДЕН"
+    )
+
+    result = subprocess.run(
+        "which ffprobe",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+
+    print(
+        "ffprobe:",
+        result.stdout.strip()
+        if result.stdout.strip()
+        else "НЕ НАЙДЕН"
+    )
+
+    print()
+
+    result = subprocess.run(
+        "nvidia-smi",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode == 0:
+
+        print("GPU обнаружен:")
+        print(result.stdout)
+
+    else:
+
+        print(
+            "nvidia-smi не сработал."
         )
 
-    with open(
-        CONFIG_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        config = json.load(f)
-
-    print(
-        "job_config.json успешно загружен."
-    )
-
-    return config
+    print("=" * 60)
 
 
 # ============================================================
-# DOWNLOAD VIDEO
+# СКАЧИВАНИЕ ВИДЕО
 # ============================================================
 
-def download_video(
-    video_url
-):
+def download_video(video_url):
 
     print(
         "1. Скачиваем видео..."
@@ -322,14 +369,20 @@ def download_video(
 
                 f.write(chunk)
 
+    size_mb = (
+        os.path.getsize(
+            VIDEO_FILE
+        ) / 1024 / 1024
+    )
+
     print(
-        "Видео скачано: "
-        f"{os.path.getsize(VIDEO_FILE) / 1024 / 1024:.2f} MB"
+        f"Видео скачано: "
+        f"{size_mb:.2f} MB"
     )
 
 
 # ============================================================
-# INSTALL RIFE
+# УСТАНОВКА RIFE
 # ============================================================
 
 def install_rife():
@@ -351,14 +404,17 @@ def install_rife():
     run(
         (
             f"wget -q --show-progress "
-            f"-O {RIFE_ZIP} "
+            f"-O '{RIFE_ZIP}' "
             f"'{RIFE_URL}'"
         ),
         "Скачивание RIFE"
     )
 
     run(
-        f"unzip -q -o {RIFE_ZIP}",
+        (
+            f"unzip -q -o "
+            f"'{RIFE_ZIP}'"
+        ),
         "Распаковка RIFE"
     )
 
@@ -371,13 +427,16 @@ def install_rife():
         )
 
     run(
-        f"chmod +x {RIFE_EXE}",
+        (
+            f"chmod +x "
+            f"'{RIFE_EXE}'"
+        ),
         "Права запуска RIFE"
     )
 
 
 # ============================================================
-# GET FPS
+# ОПРЕДЕЛЕНИЕ FPS
 # ============================================================
 
 def get_video_fps():
@@ -436,7 +495,7 @@ def get_video_fps():
 
 
 # ============================================================
-# CHECK AUDIO
+# ПРОВЕРКА АУДИО
 # ============================================================
 
 def has_audio():
@@ -462,7 +521,7 @@ def has_audio():
 
 
 # ============================================================
-# EXTRACT AUDIO
+# ИЗВЛЕЧЕНИЕ АУДИО
 # ============================================================
 
 def extract_audio():
@@ -495,7 +554,7 @@ def extract_audio():
 
 
 # ============================================================
-# EXTRACT FRAMES
+# ИЗВЛЕЧЕНИЕ КАДРОВ
 # ============================================================
 
 def extract_frames():
@@ -548,7 +607,7 @@ def extract_frames():
 
 
 # ============================================================
-# RIFE
+# RIFE INTERPOLATION
 # ============================================================
 
 def run_rife(
@@ -563,11 +622,511 @@ def run_rife(
         f"{target_fps} FPS"
     )
 
+    if target_fps <= source_fps:
+
+        print(
+            "Целевой FPS не выше "
+            "исходного. RIFE "
+            "не требуется."
+        )
+
+        if os.path.exists(
+            OUTPUT_FRAMES
+        ):
+
+            shutil.rmtree(
+                OUTPUT_FRAMES
+            )
+
+        os.makedirs(
+            OUTPUT_FRAMES
+        )
+
+        for frame in sorted(
+            Path(
+                INPUT_FRAMES
+            ).glob(
+                "*.png"
+            )
+        ):
+
+            shutil.copy2(
+                frame,
+                Path(
+                    OUTPUT_FRAMES
+                ) / frame.name
+            )
+
+        return
+
+    duration = (
+        source_frames /
+        source_fps
+    )
+
+    target_frames = round(
+        duration *
+        target_fps
+    )
+
+    print(
+        f"Целевое количество кадров: "
+        f"{target_frames}"
+    )
+
     if os.path.exists(
         OUTPUT_FRAMES
     ):
 
         shutil.rmtree(
+            OUTPUT_FRAMES
+        )
+
+    os.makedirs(
+        OUTPUT_FRAMES
+    )
+
+    command = (
+        f"{RIFE_EXE} "
+        f"-i '{INPUT_FRAMES}' "
+        f"-o '{OUTPUT_FRAMES}' "
+        f"-n {target_frames} "
+        "-m rife-v4.6"
+    )
+
+    run(
+        command,
+        "RIFE interpolation"
+    )
+
+    output_frames = sorted(
+        Path(
+            OUTPUT_FRAMES
+        ).glob(
+            "*.png"
+        )
+    )
+
+    if not output_frames:
+
+        raise RuntimeError(
+            "RIFE не создал "
+            "выходные кадры"
+        )
+
+    print(
+        f"Получено выходных кадров: "
+        f"{len(output_frames)}"
+    )
+
+
+# ============================================================
+# СОЗДАНИЕ MP4
+# ============================================================
+
+def encode_video(
+    target_fps,
+    audio
+):
+
+    print(
+        "7. Создаём итоговый MP4..."
+    )
+
+    if os.path.exists(
+        OUTPUT_FILE
+    ):
+
+        os.remove(
+            OUTPUT_FILE
+        )
+
+    if audio:
+
+        command = (
+            "ffmpeg -y "
+            f"-framerate {target_fps} "
+            f"-i '{OUTPUT_FRAMES}/%08d.png' "
+            f"-i '{AUDIO_FILE}' "
+            "-map 0:v:0 "
+            "-map 1:a:0 "
+            "-c:v libx264 "
+            "-preset veryfast "
+            "-crf 18 "
+            "-pix_fmt yuv420p "
+            "-c:a aac "
+            "-b:a 192k "
+            "-shortest "
+            f"'{OUTPUT_FILE}'"
+        )
+
+    else:
+
+        command = (
+            "ffmpeg -y "
+            f"-framerate {target_fps} "
+            f"-i '{OUTPUT_FRAMES}/%08d.png' "
+            "-c:v libx264 "
+            "-preset veryfast "
+            "-crf 18 "
+            "-pix_fmt yuv420p "
+            f"'{OUTPUT_FILE}'"
+        )
+
+    run(
+        command,
+        "Создание MP4"
+    )
+
+
+# ============================================================
+# ОТПРАВКА В TELEGRAM
+# ============================================================
+
+def send_result():
+
+    print(
+        "8. Отправляем видео "
+        "в Telegram..."
+    )
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendVideo"
+    )
+
+    with open(
+        OUTPUT_FILE,
+        "rb"
+    ) as video:
+
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID
+            },
+            files={
+                "video": (
+                    "rife_output.mp4",
+                    video,
+                    "video/mp4"
+                )
+            },
+            timeout=600
+        )
+
+    print(
+        response.text
+    )
+
+    if not response.ok:
+
+        raise RuntimeError(
+            "Telegram не смог "
+            "принять видео"
+        )
+
+
+# ============================================================
+# ОТПРАВКА ОШИБКИ
+# ============================================================
+
+def send_error(error):
+
+    try:
+
+        url = (
+            "https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/sendMessage"
+        )
+
+        requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": (
+                    "❌ Ошибка обработки:\n\n"
+                    f"{str(error)[:3500]}"
+                )
+            },
+            timeout=30
+        )
+
+    except Exception:
+
+        pass
+
+
+# ============================================================
+# ОЧИСТКА
+# ============================================================
+
+def cleanup():
+
+    for folder in [
+        INPUT_FRAMES,
+        OUTPUT_FRAMES
+    ]:
+
+        if os.path.exists(
+            folder
+        ):
+
+            shutil.rmtree(
+                folder
+            )
+
+    for file in [
+        VIDEO_FILE,
+        AUDIO_FILE,
+        OUTPUT_FILE,
+        RIFE_ZIP
+    ]:
+
+        if os.path.exists(
+            file
+        ):
+
+            os.remove(
+                file
+            )
+
+
+# ============================================================
+# MAIN WORKER
+# ============================================================
+
+def main():
+
+    print("=" * 60)
+    print(
+        "RIFE TELEGRAM WORKER"
+    )
+    print("=" * 60)
+
+    print(
+        f"Target FPS: {TARGET_FPS}"
+    )
+
+    print(
+        f"Chat ID: {CHAT_ID}"
+    )
+
+    print("=" * 60)
+
+    try:
+
+        check_environment()
+
+        download_video(
+            VIDEO_URL
+        )
+
+        install_rife()
+
+        source_fps = (
+            get_video_fps()
+        )
+
+        audio = (
+            extract_audio()
+        )
+
+        source_frames = (
+            extract_frames()
+        )
+
+        run_rife(
+            source_fps,
+            source_frames,
+            TARGET_FPS
+        )
+
+        encode_video(
+            TARGET_FPS,
+            audio
+        )
+
+        send_result()
+
+        print()
+        print("=" * 60)
+        print(
+            "ГОТОВО"
+        )
+        print("=" * 60)
+
+    except Exception as e:
+
+        print()
+        print("=" * 60)
+        print(
+            f"ОШИБКА: {e}"
+        )
+        print("=" * 60)
+
+        send_error(e)
+
+        raise
+
+    finally:
+
+        cleanup()
+
+
+if __name__ == "__main__":
+
+    main()
+'''
+
+    worker_code = worker_code.replace(
+        "__JOB_CONFIG__",
+        config_json
+    )
+
+    return worker_code
+
+
+# ============================================================
+# СОЗДАНИЕ KAGGLE PROJECT
+# ============================================================
+
+def prepare_kernel(
+    video_url,
+    chat_id,
+    target_fps
+):
+
+    if WORKER_DIR.exists():
+
+        shutil.rmtree(
+            WORKER_DIR
+        )
+
+    WORKER_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # --------------------------------------------------------
+    # СОЗДАЁМ WORKER
+    # --------------------------------------------------------
+
+    worker_code = build_worker_code(
+        video_url,
+        chat_id,
+        target_fps
+    )
+
+    worker_file = (
+        WORKER_DIR /
+        "rife-worker.py"
+    )
+
+    worker_file.write_text(
+        worker_code,
+        encoding="utf-8"
+    )
+
+    # --------------------------------------------------------
+    # REQUIREMENTS
+    # --------------------------------------------------------
+
+    requirements = (
+        "requests\n"
+    )
+
+    (
+        WORKER_DIR /
+        "requirements.txt"
+    ).write_text(
+        requirements,
+        encoding="utf-8"
+    )
+
+    # --------------------------------------------------------
+    # KAGGLE METADATA
+    # --------------------------------------------------------
+
+    metadata = {
+        "id": KERNEL_ID,
+        "title": "rife-worker",
+        "code_file": "rife-worker.py",
+        "language": "python",
+        "kernel_type": "script",
+        "is_private": "true",
+        "enable_gpu": "true",
+        "enable_internet": "true"
+    }
+
+    (
+        WORKER_DIR /
+        "kernel-metadata.json"
+    ).write_text(
+        json.dumps(
+            metadata,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+    logger.info(
+        "Kaggle Kernel project prepared"
+    )
+
+    logger.info(
+        "Files in worker: "
+        f"{[p.name for p in WORKER_DIR.iterdir()]}"
+    )
+
+
+# ============================================================
+# ОТПРАВКА JOB В KAGGLE
+# ============================================================
+
+def push_kaggle_job(
+    video_url,
+    chat_id,
+    target_fps
+):
+
+    logger.info(
+        f"Отправляем job в Kaggle: "
+        f"{KERNEL_ID}"
+    )
+
+    prepare_kernel(
+        video_url,
+        chat_id,
+        target_fps
+    )
+
+    api.kernels_push(
+        str(WORKER_DIR)
+    )
+
+    logger.info(
+        "Kaggle job успешно отправлен"
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "👋 Привет!\n\n"
+        "Отправь мне видео, которое "
+        "нужно улучшить с помощью RIFE."
+    )
+
+
+# ========        shutil.rmtree(
             OUTPUT_FRAMES
         )
 
