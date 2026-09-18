@@ -17,7 +17,9 @@ KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME", "kdidid")
 KAGGLE_API_TOKEN = os.getenv("KAGGLE_API_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 KERNEL_ID = f"{KAGGLE_USERNAME}/rife-worker"
-WORKER_DIR = Path("./kaggle_worker")
+# Use one absolute project directory so kernels_push cannot receive a different
+# relative directory depending on Render's current working directory.
+WORKER_DIR = Path("./kaggle_worker").resolve()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -57,8 +59,8 @@ def start_http_server():
 user_videos = {}
 
 
-# This template is the complete Kaggle worker. The job values are inserted
-# into the source before it is uploaded; no job_config.json is used.
+# This template is the complete Kaggle worker. The job values are embedded in
+# the uploaded source; the worker does not read job_config.json.
 WORKER_TEMPLATE = r'''import os
 import shutil
 import subprocess
@@ -196,13 +198,11 @@ def run_rife(source_fps, source_frames, target_fps):
     if os.path.exists(OUTPUT_FRAMES):
         shutil.rmtree(OUTPUT_FRAMES)
     os.makedirs(OUTPUT_FRAMES)
-
     if target_fps <= source_fps:
         print("Целевой FPS не выше исходного. RIFE не требуется.")
         for frame in sorted(Path(INPUT_FRAMES).glob("*.png")):
             shutil.copy2(frame, Path(OUTPUT_FRAMES) / frame.name)
         return
-
     target_frames = round((source_frames / source_fps) * target_fps)
     print(f"Целевое количество кадров: {target_frames}")
     run(
@@ -212,7 +212,7 @@ def run_rife(source_fps, source_frames, target_fps):
     )
     output_frames = sorted(Path(OUTPUT_FRAMES).glob("*.png"))
     if not output_frames:
-        raise RuntimeError("RIFE не создал выходные кадры")
+        raise RuntimeError("RIFE не создал выходных кадры")
     print(f"Получено выходных кадров: {len(output_frames)}")
 
 
@@ -220,10 +220,7 @@ def encode_video(target_fps, audio):
     print("7. Создаём итоговый MP4...")
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
-    command = (
-        f"ffmpeg -y -framerate {target_fps} "
-        f"-i '{OUTPUT_FRAMES}/%08d.png' "
-    )
+    command = f"ffmpeg -y -framerate {target_fps} -i '{OUTPUT_FRAMES}/%08d.png' "
     if audio:
         command += (
             f"-i '{AUDIO_FILE}' -map 0:v:0 -map 1:a:0 "
@@ -237,10 +234,9 @@ def encode_video(target_fps, audio):
 
 def send_result():
     print("8. Отправляем видео в Telegram...")
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
     with open(OUTPUT_FILE, "rb") as video:
         response = requests.post(
-            url,
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
             data={"chat_id": CHAT_ID},
             files={"video": ("rife_output.mp4", video, "video/mp4")},
             timeout=600,
@@ -304,39 +300,65 @@ def build_worker_code(video_url, chat_id, target_fps):
         "BOT_TOKEN": BOT_TOKEN,
         "TARGET_FPS": int(target_fps),
     }
-    return WORKER_TEMPLATE.replace(
+    code = WORKER_TEMPLATE.replace(
         "__JOB_CONFIG__", json.dumps(worker_config, ensure_ascii=False)
     )
+    if "load_config()" in code or "job_config.json" in code:
+        raise RuntimeError("Сформирован устаревший Kaggle worker")
+    return code
 
 
 def prepare_kernel(video_url, chat_id, target_fps):
+    # Recreate the project, rather than updating selected files. This prevents
+    # an old script.py or stale metadata from being included in the upload.
     if WORKER_DIR.exists():
-        shutil.rmtree(WORKER_DIR)
-    WORKER_DIR.mkdir(parents=True, exist_ok=True)
+        if not WORKER_DIR.is_dir():
+            WORKER_DIR.unlink()
+        else:
+            shutil.rmtree(WORKER_DIR)
+    WORKER_DIR.mkdir(parents=True, exist_ok=False)
 
-    (WORKER_DIR / "rife-worker.py").write_text(
-        build_worker_code(video_url, chat_id, target_fps), encoding="utf-8"
-    )
-    (WORKER_DIR / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    worker_path = WORKER_DIR / "rife-worker.py"
+    metadata_path = WORKER_DIR / "kernel-metadata.json"
+    requirements_path = WORKER_DIR / "requirements.txt"
+
+    worker_code = build_worker_code(video_url, chat_id, target_fps)
+    worker_path.write_text(worker_code, encoding="utf-8")
+    requirements_path.write_text("requests\n", encoding="utf-8")
     metadata = {
         "id": KERNEL_ID,
         "title": "rife-worker",
         "code_file": "rife-worker.py",
         "language": "python",
         "kernel_type": "script",
-        "is_private": "true",
-        "enable_gpu": "true",
-        "enable_internet": "true",
+        "is_private": True,
+        "enable_gpu": True,
+        "enable_internet": True,
         "machine_shape": "NvidiaTeslaT4",
     }
-    (WORKER_DIR / "kernel-metadata.json").write_text(
-        json.dumps(metadata, indent=2), encoding="utf-8"
-    )
-    logger.info("Kaggle Kernel project prepared: %s", WORKER_DIR.resolve())
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    # Validate the exact directory that will be passed to kernels_push.
+    expected_files = {"rife-worker.py", "requirements.txt", "kernel-metadata.json"}
+    actual_files = {path.name for path in WORKER_DIR.iterdir() if path.is_file()}
+    if actual_files != expected_files:
+        raise RuntimeError(f"Неверное содержимое Kaggle project: {actual_files}")
+    if "load_config()" in worker_code or "job_config.json" in worker_code:
+        raise RuntimeError("В worker обнаружена старая конфигурация")
+    loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if loaded_metadata["code_file"] != "rife-worker.py":
+        raise RuntimeError("Kaggle metadata указывает не на rife-worker.py")
+    if loaded_metadata["kernel_type"] != "script":
+        raise RuntimeError("Kaggle kernel_type должен быть script")
+    if loaded_metadata["enable_gpu"] is not True or loaded_metadata["enable_internet"] is not True:
+        raise RuntimeError("GPU и Internet должны быть включены")
+    logger.info("Fresh Kaggle project prepared: %s; files=%s", WORKER_DIR, sorted(actual_files))
 
 
 def push_kaggle_job(video_url, chat_id, target_fps):
     prepare_kernel(video_url, chat_id, target_fps)
+    # kernels_push uploads the complete, freshly recreated project directory.
+    # Do not pull the kernel: that could restore the obsolete script.py locally.
     api.kernels_push(str(WORKER_DIR))
     logger.info("Kaggle job успешно отправлен: %s", KERNEL_ID)
 
@@ -362,17 +384,14 @@ async def fps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_videos:
         await update.message.reply_text("Сначала отправь видео.")
         return
-
     try:
         target_fps = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ FPS должен быть числом.\nНапример: 60")
         return
-
     if not 1 <= target_fps <= 240:
         await update.message.reply_text("❌ FPS должен быть от 1 до 240.")
         return
-
     await update.message.reply_text("⏳ Подготавливаю задачу для Kaggle...")
     try:
         telegram_file = await context.bot.get_file(user_videos[user_id]["file_id"])
