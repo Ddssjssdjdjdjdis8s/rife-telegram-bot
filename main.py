@@ -90,7 +90,7 @@ OUTPUT_FILE = "output.mp4"
 
 
 def run(command, name):
-    print("\\n" + "=" * 60)
+    print("\n" + "=" * 60)
     print(name)
     print(command)
     print("=" * 60)
@@ -132,6 +132,26 @@ def install_rife():
     if not os.path.exists(RIFE_EXE):
         raise RuntimeError("RIFE executable не найден")
     run(f"chmod +x '{RIFE_EXE}'", "Права запуска RIFE")
+
+
+def install_vulkan_runtime():
+    print("6. Устанавливаем Vulkan runtime...")
+    run(
+        "export DEBIAN_FRONTEND=noninteractive && "
+        "apt-get update -y && "
+        "apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers && "
+        "ldconfig",
+        "Установка Vulkan runtime",
+    )
+    result = subprocess.run(
+        "ldconfig -p | grep libvulkan.so.1",
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    print("Проверка libvulkan.so.1:", result.stdout.strip())
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("После установки не найден libvulkan.so.1")
 
 
 def get_video_fps():
@@ -205,6 +225,7 @@ def run_rife(source_fps, source_frames, target_fps):
         return
     target_frames = round((source_frames / source_fps) * target_fps)
     print(f"Целевое количество кадров: {target_frames}")
+    install_vulkan_runtime()
     run(
         f"{RIFE_EXE} -i '{INPUT_FRAMES}' -o '{OUTPUT_FRAMES}' "
         f"-n {target_frames} -m rife-v4.6",
