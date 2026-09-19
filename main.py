@@ -17,24 +17,17 @@ KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME", "kdidid")
 KAGGLE_API_TOKEN = os.getenv("KAGGLE_API_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 KERNEL_ID = f"{KAGGLE_USERNAME}/rife-worker"
-# Use one absolute project directory so kernels_push cannot receive a different
-# relative directory depending on Render's current working directory.
 WORKER_DIR = Path("./kaggle_worker").resolve()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN")
 if not KAGGLE_API_TOKEN:
     raise RuntimeError("Не найден KAGGLE_API_TOKEN")
-
 os.environ["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
 os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-
 api = KaggleApi()
 api.authenticate()
 
@@ -59,9 +52,8 @@ def start_http_server():
 user_videos = {}
 
 
-# This template is the complete Kaggle worker. The job values are embedded in
-# the uploaded source; the worker does not read job_config.json.
 WORKER_TEMPLATE = r'''import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -75,10 +67,8 @@ CHAT_ID = JOB_CONFIG["CHAT_ID"]
 BOT_TOKEN = JOB_CONFIG["BOT_TOKEN"]
 TARGET_FPS = int(JOB_CONFIG["TARGET_FPS"])
 
-RIFE_URL = (
-    "https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
-    "20221029/rife-ncnn-vulkan-20221029-ubuntu.zip"
-)
+RIFE_URL = ("https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
+            "20221029/rife-ncnn-vulkan-20221029-ubuntu.zip")
 RIFE_ZIP = "rife.zip"
 RIFE_DIR = "rife-ncnn-vulkan-20221029-ubuntu"
 RIFE_EXE = f"./{RIFE_DIR}/rife-ncnn-vulkan"
@@ -119,8 +109,7 @@ def download_video(video_url):
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 output.write(chunk)
-    size_mb = os.path.getsize(VIDEO_FILE) / 1024 / 1024
-    print(f"Видео скачано: {size_mb:.2f} MB")
+    print(f"Видео скачано: {os.path.getsize(VIDEO_FILE) / 1024 / 1024:.2f} MB")
 
 
 def install_rife():
@@ -136,31 +125,55 @@ def install_rife():
 
 def install_vulkan_runtime():
     print("6. Устанавливаем Vulkan runtime...")
-    run(
-        "export DEBIAN_FRONTEND=noninteractive && "
-        "apt-get update -y && "
-        "apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers && "
-        "ldconfig",
-        "Установка Vulkan runtime",
-    )
-    result = subprocess.run(
-        "ldconfig -p | grep libvulkan.so.1",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
+    run("export DEBIAN_FRONTEND=noninteractive && apt-get update -y && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-tools && ldconfig", "Установка Vulkan runtime")
+    result = subprocess.run("ldconfig -p | grep libvulkan.so.1", shell=True, capture_output=True, text=True)
     print("Проверка libvulkan.so.1:", result.stdout.strip())
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError("После установки не найден libvulkan.so.1")
 
 
+def configure_nvidia_vulkan():
+    """List Vulkan devices, then force RIFE onto the NVIDIA ICD/device."""
+    result = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True)
+    inventory = result.stdout + "\n" + result.stderr
+    if result.returncode != 0 and not inventory.strip():
+        raise RuntimeError("Не удалось получить список Vulkan devices через vulkaninfo")
+
+    names = re.findall(r"(?:deviceName|Device Name)\s*=\s*(.+)", inventory)
+    if not names:
+        names = re.findall(r"GPU\d+\s*:\s*(.+)", inventory)
+    print("Доступные Vulkan devices:")
+    for index, name in enumerate(names):
+        print(f"  Vulkan device {index}: {name.strip()}")
+    if not names:
+        print(inventory)
+
+    nvidia_names = [name.strip() for name in names if "nvidia" in name.lower()]
+    if not nvidia_names:
+        raise RuntimeError("NVIDIA Vulkan device недоступен; остановка вместо запуска через llvmpipe")
+
+    icd_dirs = (Path("/usr/share/vulkan/icd.d"), Path("/etc/vulkan/icd.d"))
+    icd_files = []
+    for directory in icd_dirs:
+        if directory.exists():
+            icd_files.extend(sorted(directory.glob("*nvidia*.json")))
+    if not icd_files:
+        raise RuntimeError("Найден NVIDIA Vulkan device, но NVIDIA ICD не найден")
+
+    # With only the NVIDIA ICD visible, ncnn's -g 0 cannot select llvmpipe.
+    os.environ["VK_ICD_FILENAMES"] = os.pathsep.join(str(path) for path in icd_files)
+    forced = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, env=os.environ)
+    forced_inventory = forced.stdout + "\n" + forced.stderr
+    forced_names = re.findall(r"(?:deviceName|Device Name)\s*=\s*(.+)", forced_inventory)
+    if not any("nvidia" in name.lower() for name in forced_names):
+        raise RuntimeError("NVIDIA Vulkan ICD не предоставил usable device; llvmpipe запрещён")
+    selected = next(name.strip() for name in forced_names if "nvidia" in name.lower())
+    print(f"Vulkan device selected: {selected}")
+    print("RIFE Vulkan device index: 0 (NVIDIA ICD forced)")
+
+
 def get_video_fps():
-    command = (
-        "ffprobe -v error -select_streams v:0 "
-        "-show_entries stream=r_frame_rate "
-        "-of default=noprint_wrappers=1:nokey=1 "
-        f"'{VIDEO_FILE}'"
-    )
+    command = "ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 '" + VIDEO_FILE + "'"
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError("Не удалось определить FPS")
@@ -175,14 +188,7 @@ def get_video_fps():
 
 
 def has_audio():
-    result = subprocess.run(
-        "ffprobe -v error -select_streams a:0 "
-        "-show_entries stream=index -of csv=p=0 "
-        f"'{VIDEO_FILE}'",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
+    result = subprocess.run("ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 '" + VIDEO_FILE + "'", shell=True, capture_output=True, text=True)
     return bool(result.stdout.strip())
 
 
@@ -190,10 +196,7 @@ def extract_audio():
     if not has_audio():
         print("Аудио отсутствует.")
         return False
-    run(
-        f"ffmpeg -y -i '{VIDEO_FILE}' -vn -c:a aac -b:a 192k '{AUDIO_FILE}'",
-        "Извлечение аудио",
-    )
+    run(f"ffmpeg -y -i '{VIDEO_FILE}' -vn -c:a aac -b:a 192k '{AUDIO_FILE}'", "Извлечение аудио")
     return True
 
 
@@ -202,10 +205,7 @@ def extract_frames():
     if os.path.exists(INPUT_FRAMES):
         shutil.rmtree(INPUT_FRAMES)
     os.makedirs(INPUT_FRAMES)
-    run(
-        f"ffmpeg -y -i '{VIDEO_FILE}' '{INPUT_FRAMES}/frame_%08d.png'",
-        "Извлечение кадров",
-    )
+    run(f"ffmpeg -y -i '{VIDEO_FILE}' '{INPUT_FRAMES}/frame_%08d.png'", "Извлечение кадров")
     frames = sorted(Path(INPUT_FRAMES).glob("*.png"))
     if not frames:
         raise RuntimeError("Кадры не были созданы")
@@ -226,11 +226,8 @@ def run_rife(source_fps, source_frames, target_fps):
     target_frames = round((source_frames / source_fps) * target_fps)
     print(f"Целевое количество кадров: {target_frames}")
     install_vulkan_runtime()
-    run(
-        f"{RIFE_EXE} -i '{INPUT_FRAMES}' -o '{OUTPUT_FRAMES}' "
-        f"-n {target_frames} -m rife-v4.6",
-        "RIFE interpolation",
-    )
+    configure_nvidia_vulkan()
+    run(f"{RIFE_EXE} -g 0 -i '{INPUT_FRAMES}' -o '{OUTPUT_FRAMES}' -n {target_frames} -m rife-v4.6", "RIFE interpolation")
     output_frames = sorted(Path(OUTPUT_FRAMES).glob("*.png"))
     if not output_frames:
         raise RuntimeError("RIFE не создал выходных кадры")
@@ -243,11 +240,7 @@ def encode_video(target_fps, audio):
         os.remove(OUTPUT_FILE)
     command = f"ffmpeg -y -framerate {target_fps} -i '{OUTPUT_FRAMES}/%08d.png' "
     if audio:
-        command += (
-            f"-i '{AUDIO_FILE}' -map 0:v:0 -map 1:a:0 "
-            "-c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "
-            "-c:a aac -b:a 192k -shortest "
-        )
+        command += f"-i '{AUDIO_FILE}' -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest "
     else:
         command += "-c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "
     run(command + f"'{OUTPUT_FILE}'", "Создание MP4")
@@ -256,12 +249,7 @@ def encode_video(target_fps, audio):
 def send_result():
     print("8. Отправляем видео в Telegram...")
     with open(OUTPUT_FILE, "rb") as video:
-        response = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-            data={"chat_id": CHAT_ID},
-            files={"video": ("rife_output.mp4", video, "video/mp4")},
-            timeout=600,
-        )
+        response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo", data={"chat_id": CHAT_ID}, files={"video": ("rife_output.mp4", video, "video/mp4")}, timeout=600)
     print(response.text)
     if not response.ok:
         raise RuntimeError("Telegram не смог принять видео")
@@ -269,11 +257,7 @@ def send_result():
 
 def send_error(error):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": f"❌ Ошибка обработки:\n\n{str(error)[:3500]}"},
-            timeout=30,
-        )
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": f"❌ Ошибка обработки:\n\n{str(error)[:3500]}"}, timeout=30)
     except Exception:
         pass
 
@@ -315,51 +299,28 @@ if __name__ == "__main__":
 
 
 def build_worker_code(video_url, chat_id, target_fps):
-    worker_config = {
-        "VIDEO_URL": video_url,
-        "CHAT_ID": str(chat_id),
-        "BOT_TOKEN": BOT_TOKEN,
-        "TARGET_FPS": int(target_fps),
-    }
-    code = WORKER_TEMPLATE.replace(
-        "__JOB_CONFIG__", json.dumps(worker_config, ensure_ascii=False)
-    )
+    worker_config = {"VIDEO_URL": video_url, "CHAT_ID": str(chat_id), "BOT_TOKEN": BOT_TOKEN, "TARGET_FPS": int(target_fps)}
+    code = WORKER_TEMPLATE.replace("__JOB_CONFIG__", json.dumps(worker_config, ensure_ascii=False))
     if "load_config()" in code or "job_config.json" in code:
         raise RuntimeError("Сформирован устаревший Kaggle worker")
     return code
 
 
 def prepare_kernel(video_url, chat_id, target_fps):
-    # Recreate the project, rather than updating selected files. This prevents
-    # an old script.py or stale metadata from being included in the upload.
     if WORKER_DIR.exists():
         if not WORKER_DIR.is_dir():
             WORKER_DIR.unlink()
         else:
             shutil.rmtree(WORKER_DIR)
     WORKER_DIR.mkdir(parents=True, exist_ok=False)
-
     worker_path = WORKER_DIR / "rife-worker.py"
     metadata_path = WORKER_DIR / "kernel-metadata.json"
     requirements_path = WORKER_DIR / "requirements.txt"
-
     worker_code = build_worker_code(video_url, chat_id, target_fps)
     worker_path.write_text(worker_code, encoding="utf-8")
     requirements_path.write_text("requests\n", encoding="utf-8")
-    metadata = {
-        "id": KERNEL_ID,
-        "title": "rife-worker",
-        "code_file": "rife-worker.py",
-        "language": "python",
-        "kernel_type": "script",
-        "is_private": True,
-        "enable_gpu": True,
-        "enable_internet": True,
-        "machine_shape": "NvidiaTeslaT4",
-    }
+    metadata = {"id": KERNEL_ID, "title": "rife-worker", "code_file": "rife-worker.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "machine_shape": "NvidiaTeslaT4"}
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-
-    # Validate the exact directory that will be passed to kernels_push.
     expected_files = {"rife-worker.py", "requirements.txt", "kernel-metadata.json"}
     actual_files = {path.name for path in WORKER_DIR.iterdir() if path.is_file()}
     if actual_files != expected_files:
@@ -367,10 +328,8 @@ def prepare_kernel(video_url, chat_id, target_fps):
     if "load_config()" in worker_code or "job_config.json" in worker_code:
         raise RuntimeError("В worker обнаружена старая конфигурация")
     loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if loaded_metadata["code_file"] != "rife-worker.py":
-        raise RuntimeError("Kaggle metadata указывает не на rife-worker.py")
-    if loaded_metadata["kernel_type"] != "script":
-        raise RuntimeError("Kaggle kernel_type должен быть script")
+    if loaded_metadata["code_file"] != "rife-worker.py" or loaded_metadata["kernel_type"] != "script":
+        raise RuntimeError("Некорректные Kaggle metadata")
     if loaded_metadata["enable_gpu"] is not True or loaded_metadata["enable_internet"] is not True:
         raise RuntimeError("GPU и Internet должны быть включены")
     logger.info("Fresh Kaggle project prepared: %s; files=%s", WORKER_DIR, sorted(actual_files))
@@ -378,16 +337,12 @@ def prepare_kernel(video_url, chat_id, target_fps):
 
 def push_kaggle_job(video_url, chat_id, target_fps):
     prepare_kernel(video_url, chat_id, target_fps)
-    # kernels_push uploads the complete, freshly recreated project directory.
-    # Do not pull the kernel: that could restore the obsolete script.py locally.
     api.kernels_push(str(WORKER_DIR))
     logger.info("Kaggle job успешно отправлен: %s", KERNEL_ID)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет!\n\nОтправь мне видео, которое нужно улучшить с помощью RIFE."
-    )
+    await update.message.reply_text("👋 Привет!\n\nОтправь мне видео, которое нужно улучшить с помощью RIFE.")
 
 
 async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,9 +350,7 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not video:
         return
     user_videos[update.effective_user.id] = {"file_id": video.file_id}
-    await update.message.reply_text(
-        "🎬 Видео получено!\n\nДо скольки FPS улучшить?\n\nНапример: 60"
-    )
+    await update.message.reply_text("🎬 Видео получено!\n\nДо скольки FPS улучшить?\n\nНапример: 60")
 
 
 async def fps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,20 +374,12 @@ async def fps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_url = file_path
         else:
             file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-        await asyncio.to_thread(
-            push_kaggle_job, file_url, update.effective_chat.id, target_fps
-        )
-        await update.message.reply_text(
-            f"✅ Задача отправлена в Kaggle!\n\n🎞 Целевой FPS: {target_fps}\n\n"
-            "Когда обработка закончится, я отправлю готовое видео сюда."
-        )
+        await asyncio.to_thread(push_kaggle_job, file_url, update.effective_chat.id, target_fps)
+        await update.message.reply_text(f"✅ Задача отправлена в Kaggle!\n\n🎞 Целевой FPS: {target_fps}\n\nКогда обработка закончится, я отправлю готовое видео сюда.")
         del user_videos[user_id]
     except Exception as error:
         logger.exception("Ошибка отправки задачи в Kaggle")
-        await update.message.reply_text(
-            f"❌ Не удалось отправить задачу в Kaggle.\n\n"
-            f"{type(error).__name__}: {error}"
-        )
+        await update.message.reply_text(f"❌ Не удалось отправить задачу в Kaggle.\n\n{type(error).__name__}: {error}")
 
 
 def main():
