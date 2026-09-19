@@ -52,7 +52,8 @@ def start_http_server():
 user_videos = {}
 
 
-WORKER_TEMPLATE = r'''import os
+WORKER_TEMPLATE = r'''import json
+import os
 import re
 import shutil
 import subprocess
@@ -97,8 +98,9 @@ def check_environment():
         print(command, ":", result.stdout.strip() or "НЕ НАЙДЕН")
     result = subprocess.run("nvidia-smi", shell=True, capture_output=True, text=True)
     print("GPU обнаружен:" if result.returncode == 0 else "nvidia-smi не сработал.")
-    if result.returncode == 0:
-        print(result.stdout)
+    print(result.stdout)
+    if result.stderr:
+        print("nvidia-smi stderr:", result.stderr)
 
 
 def download_video(video_url):
@@ -124,7 +126,7 @@ def install_rife():
 
 
 def install_vulkan_runtime():
-    print("6. Устанавливаем Vulkan runtime...")
+    print("6. Устанавливаем Vulkan runtime (без удаления существующих пакетов)...")
     run("export DEBIAN_FRONTEND=noninteractive && apt-get update -y && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-tools && ldconfig", "Установка Vulkan runtime")
     result = subprocess.run("ldconfig -p | grep libvulkan.so.1", shell=True, capture_output=True, text=True)
     print("Проверка libvulkan.so.1:", result.stdout.strip())
@@ -132,44 +134,96 @@ def install_vulkan_runtime():
         raise RuntimeError("После установки не найден libvulkan.so.1")
 
 
-def configure_nvidia_vulkan():
-    """List Vulkan devices, then force RIFE onto the NVIDIA ICD/device."""
-    result = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True)
-    inventory = result.stdout + "\n" + result.stderr
-    if result.returncode != 0 and not inventory.strip():
-        raise RuntimeError("Не удалось получить список Vulkan devices через vulkaninfo")
+def _run_output(command, env=None):
+    result = subprocess.run(command, capture_output=True, text=True, env=env)
+    output = result.stdout + ("\n" + result.stderr if result.stderr else "")
+    return result.returncode, output
 
-    names = re.findall(r"(?:deviceName|Device Name)\s*=\s*(.+)", inventory)
-    if not names:
-        names = re.findall(r"GPU\d+\s*:\s*(.+)", inventory)
-    print("Доступные Vulkan devices:")
-    for index, name in enumerate(names):
-        print(f"  Vulkan device {index}: {name.strip()}")
-    if not names:
-        print(inventory)
 
-    nvidia_names = [name.strip() for name in names if "nvidia" in name.lower()]
-    if not nvidia_names:
-        raise RuntimeError("NVIDIA Vulkan device недоступен; остановка вместо запуска через llvmpipe")
+def _print_nvidia_vulkan_diagnostics():
+    print("\n" + "=" * 80)
+    print("NVIDIA VULKAN DIAGNOSTICS")
+    print("=" * 80)
 
-    icd_dirs = (Path("/usr/share/vulkan/icd.d"), Path("/etc/vulkan/icd.d"))
+    code, output = _run_output(["nvidia-smi"])
+    print("$ nvidia-smi (exit", code, ")\n", output or "<нет вывода>")
+
+    directories = (Path("/usr/share/vulkan/icd.d"), Path("/etc/vulkan/icd.d"))
     icd_files = []
-    for directory in icd_dirs:
+    for directory in directories:
+        print(f"ICD directory {directory}: {'exists' if directory.exists() else 'absent'}")
         if directory.exists():
-            icd_files.extend(sorted(directory.glob("*nvidia*.json")))
-    if not icd_files:
-        raise RuntimeError("Найден NVIDIA Vulkan device, но NVIDIA ICD не найден")
+            files = sorted(directory.glob("*.json"))
+            icd_files.extend(files)
+            print("  JSON files:", [str(path) for path in files] or "<нет>")
+            for path in files:
+                try:
+                    print(f"\n--- {path} ---")
+                    print(path.read_text(encoding="utf-8", errors="replace"))
+                except Exception as error:
+                    print(f"Не удалось прочитать {path}: {error}")
 
-    # With only the NVIDIA ICD visible, ncnn's -g 0 cannot select llvmpipe.
-    os.environ["VK_ICD_FILENAMES"] = os.pathsep.join(str(path) for path in icd_files)
-    forced = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, env=os.environ)
-    forced_inventory = forced.stdout + "\n" + forced.stderr
-    forced_names = re.findall(r"(?:deviceName|Device Name)\s*=\s*(.+)", forced_inventory)
-    if not any("nvidia" in name.lower() for name in forced_names):
-        raise RuntimeError("NVIDIA Vulkan ICD не предоставил usable device; llvmpipe запрещён")
-    selected = next(name.strip() for name in forced_names if "nvidia" in name.lower())
+    print("Environment:")
+    for name in ("VK_ICD_FILENAMES", "VK_DRIVER_FILES", "LD_LIBRARY_PATH"):
+        print(f"  {name}={os.environ.get(name, '<не установлена>')}")
+
+    print("NVIDIA-related Vulkan libraries found on the container:")
+    library_commands = [
+        "ldconfig -p | grep -Ei 'nvidia|vulkan' || true",
+        "find /usr /lib /opt -type f \\\n            \( -iname '*nvidia*vulkan*' -o -iname 'libGLX_nvidia.so*' -o -iname 'libnvidia-vulkan-producer.so*' \\\n            \) 2>/dev/null | sort -u || true",
+    ]
+    for command in library_commands:
+        code, output = _run_output(["bash", "-lc", command])
+        print(f"$ {command}\n{output or '<не найдено>'}")
+    print("Required-name checks:")
+    for library_name in ("libnvidia-vulkan-producer.so", "libGLX_nvidia.so"):
+        code, output = _run_output(["bash", "-lc", f"find /usr /lib /opt -type f -name '{library_name}*' 2>/dev/null | sort -u"])
+        print(f"  {library_name}: {output.strip() or '<не найдено>'}")
+    return icd_files
+
+
+def _is_nvidia_icd(path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(text)
+        blob = json.dumps(data, ensure_ascii=False).lower()
+        return "nvidia" in path.name.lower() or "nvidia" in blob
+    except (OSError, ValueError):
+        return "nvidia" in path.name.lower()
+
+
+def _vulkan_device_names(output):
+    names = re.findall(r"(?:deviceName|Device Name)\s*=\s*(.+)", output)
+    if not names:
+        names = re.findall(r"GPU\d+\s*:\s*(.+)", output)
+    return [name.strip() for name in names]
+
+
+def configure_nvidia_vulkan():
+    """Diagnose the container, select only its real NVIDIA ICD, and reject llvmpipe."""
+    icd_files = _print_nvidia_vulkan_diagnostics()
+    nvidia_icds = [path for path in icd_files if _is_nvidia_icd(path)]
+    print("NVIDIA ICD candidates:", [str(path) for path in nvidia_icds] or "<нет>")
+    if not nvidia_icds:
+        raise RuntimeError("В Kaggle container не найден NVIDIA Vulkan ICD JSON; nvidia-smi сам по себе не доказывает наличие Vulkan device")
+
+    # Use the actual discovered JSON paths; do not assume a library location.
+    os.environ["VK_ICD_FILENAMES"] = os.pathsep.join(str(path) for path in nvidia_icds)
+    os.environ.pop("VK_DRIVER_FILES", None)
+    print("VK_ICD_FILENAMES установлен в:", os.environ["VK_ICD_FILENAMES"])
+
+    code, forced_inventory = _run_output(["vulkaninfo", "--summary"], env=os.environ.copy())
+    print("\nVulkan after NVIDIA ICD selection (exit", code, "):\n", forced_inventory)
+    forced_names = _vulkan_device_names(forced_inventory)
+    real_nvidia_names = [name for name in forced_names
+                         if "nvidia" in name.lower() and "llvmpipe" not in name.lower()]
+    print("Vulkan devices:", forced_names or "<не распознаны>")
+    if not real_nvidia_names:
+        _print_nvidia_vulkan_diagnostics()
+        raise RuntimeError("NVIDIA Vulkan device всё ещё отсутствует после выбора обнаруженного ICD; llvmpipe запрещён, RIFE остановлен")
+    selected = real_nvidia_names[0]
     print(f"Vulkan device selected: {selected}")
-    print("RIFE Vulkan device index: 0 (NVIDIA ICD forced)")
+    print("RIFE Vulkan device index: 0 (только NVIDIA ICD; llvmpipe не используется)")
 
 
 def get_video_fps():
@@ -319,7 +373,7 @@ def prepare_kernel(video_url, chat_id, target_fps):
     worker_code = build_worker_code(video_url, chat_id, target_fps)
     worker_path.write_text(worker_code, encoding="utf-8")
     requirements_path.write_text("requests\n", encoding="utf-8")
-    metadata = {"id": KERNEL_ID, "title": "rife-worker", "code_file": "rife-worker.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "machine_shape": "NvidiaTeslaT4"}
+    metadata = {"id": KERNEL_ID, "title": "rife-worker", "code_file": "rife-worker.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True}
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     expected_files = {"rife-worker.py", "requirements.txt", "kernel-metadata.json"}
     actual_files = {path.name for path in WORKER_DIR.iterdir() if path.is_file()}
@@ -375,7 +429,7 @@ async def fps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         await asyncio.to_thread(push_kaggle_job, file_url, update.effective_chat.id, target_fps)
-        await update.message.reply_text(f"✅ Задача отправлена в Kaggle!\n\n🎞 Целевой FPS: {target_fps}\n\nКогда обработка закончится, я отправлю готовое видео сюда.")
+        await update.message.reply_text(f"✅ Задача отправлена в Kaggle!\n\n🎞 Целевой FPS: {target_fps}\n\nКогда обработка закончится, я отправлю видео.")
         del user_videos[user_id]
     except Exception as error:
         logger.exception("Ошибка отправки задачи в Kaggle")
